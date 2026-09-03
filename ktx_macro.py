@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -33,6 +35,7 @@ from korail_mobile_api import (
     KorailClient,
     KorailConfig,
     KorailNoResultsError,
+    KorailPassengerCounts,
     KorailSeatClass,
     KorailSessionExpiredError,
     KorailSoldOutError,
@@ -137,6 +140,23 @@ def format_train(train) -> str:
     return f"[{type_name}] {train_no} {dep}→{arr} ({seat_status(train)})"
 
 
+def seated_count(passengers: KorailPassengerCounts) -> int:
+    """조회에 쓸 좌석 점유 인원. 동반유아는 좌석이 없으므로 제외한다."""
+    return max(1, passengers.total - passengers.infant)
+
+
+def format_passengers(passengers: KorailPassengerCounts) -> str:
+    labels = (
+        ("adult", "어른"),
+        ("teenager", "청소년"),
+        ("child", "어린이"),
+        ("senior", "경로"),
+        ("infant", "유아"),
+    )
+    parts = [f"{label} {getattr(passengers, attr)}" for attr, label in labels if getattr(passengers, attr)]
+    return f"총 {passengers.total}명 ({', '.join(parts)})"
+
+
 def notify_success() -> None:
     try:
         import winsound
@@ -147,10 +167,38 @@ def notify_success() -> None:
         print("\a", end="", flush=True)
 
 
+@dataclass
+class Leg:
+    """조회·예약할 구간 하나. 왕복이면 두 개를 만든다."""
+
+    name: str
+    date: str
+    dep: str
+    arr: str
+    start_time: str
+    end_time: str
+    arrive_before: str | None = None
+    result: object = field(default=None, repr=False)
+
+    @property
+    def done(self) -> bool:
+        return self.result is not None
+
+    def describe(self) -> str:
+        arrive_txt = f", 도착 {self.arrive_before} 전" if self.arrive_before else ""
+        return f"{self.date} {self.dep} -> {self.arr} (출발 {self.start_time}~{self.end_time}{arrive_txt})"
+
+
 class KTXMacro:
-    def __init__(self, korail_id: str, korail_pw: str):
+    def __init__(
+        self,
+        korail_id: str,
+        korail_pw: str,
+        passengers: KorailPassengerCounts | None = None,
+    ):
         self.korail_id = normalize_login_id(korail_id)
         self.korail_pw = korail_pw
+        self.passengers = passengers or KorailPassengerCounts()
         self.client = KorailClient(KorailConfig(enable_dynapath=True))
         self._login()
 
@@ -195,6 +243,7 @@ class KTXMacro:
             arr,
             date,
             departure_time=start,
+            passengers=seated_count(self.passengers),
             train_group_code=KTX_TRAIN_GROUP,
         )
 
@@ -241,6 +290,7 @@ class KTXMacro:
             hold = self.client.reserve(
                 train,
                 consent=consent,
+                passengers=self.passengers,
                 seat_class=preferred_seat_class(train),
             )
             logger.info("예약 성공: %s", hold)
@@ -266,75 +316,118 @@ class KTXMacro:
         interval: int = 8,
         max_attempts: int = 0,
         search_only: bool = False,
+        stop_event: threading.Event | None = None,
     ):
-        arrive_txt = f", 도착 {arrive_before} 전" if arrive_before else ""
-        attempts_txt = "무제한" if max_attempts <= 0 else f"{max_attempts}회"
-        logger.info(
-            "검색 시작: %s %s -> %s (출발 %s~%s%s) | 간격 %s초 | 최대 %s",
-            date,
-            dep,
-            arr,
-            start_time,
-            end_time,
-            arrive_txt,
-            interval,
-            attempts_txt,
+        """편도 한 구간. 예약 응답을 돌려주고, 못 잡으면 None."""
+        leg = Leg("편도", date, dep, arr, start_time, end_time, arrive_before)
+        self.run_legs(
+            [leg],
+            interval=interval,
+            max_attempts=max_attempts,
+            search_only=search_only,
+            stop_event=stop_event,
         )
+        return leg.result
+
+    def run_legs(
+        self,
+        legs: list[Leg],
+        interval: int = 8,
+        max_attempts: int = 0,
+        search_only: bool = False,
+        stop_event: threading.Event | None = None,
+    ) -> list[Leg]:
+        """여러 구간을 한 세션에서 번갈아 조회한다. 예약된 구간은 빼고 남은 구간만 계속 찾는다."""
+        if not legs:
+            raise ValueError("조회할 구간이 없습니다.")
+        multi = len(legs) > 1
+        attempts_txt = "무제한" if max_attempts <= 0 else f"{max_attempts}회"
+        logger.info("검색 시작 | 간격 %s초 | 최대 %s | 구간 %s개", interval, attempts_txt, len(legs))
+        for leg in legs:
+            logger.info("  [%s] %s", leg.name, leg.describe())
+        logger.info("인원: %s", format_passengers(self.passengers))
         logger.info("입석/입석+좌석은 무시하고, 일반실·특실 지정석만 예약합니다. 무궁화호는 제외합니다.")
 
         attempt = 0
         while True:
+            if stop_event is not None and stop_event.is_set():
+                logger.info("중지 요청으로 종료합니다.")
+                return legs
             attempt += 1
             if max_attempts > 0 and attempt > max_attempts:
                 logger.warning("최대 시도 횟수 도달. 종료")
-                return None
+                return legs
 
             self._ensure_login()
             logger.info("[%s] 검색 중...", attempt if max_attempts <= 0 else f"{attempt}/{max_attempts}")
 
-            try:
-                trains = self.search_trains(date, dep, arr, start_time, end_time, arrive_before)
-            except Exception as exc:
-                logger.error("검색 중 예외: %s", exc)
-                time.sleep(interval)
-                continue
+            for leg in legs:
+                if leg.done:
+                    continue
+                tag = f"[{leg.name}] " if multi else ""
+                try:
+                    trains = self.search_trains(
+                        leg.date, leg.dep, leg.arr, leg.start_time, leg.end_time, leg.arrive_before
+                    )
+                except Exception as exc:
+                    logger.error("%s검색 중 예외: %s", tag, exc)
+                    continue
 
-            if not trains:
-                logger.info("조건에 맞는 열차 없음. 대기...")
-            else:
+                if not trains:
+                    logger.info("%s조건에 맞는 열차 없음. 대기...", tag)
+                    continue
+
                 seated = [train for train in trains if has_assigned_seat(train)]
                 for train in trains:
-                    logger.info("  %s", format_train(train))
+                    logger.info("  %s%s", tag, format_train(train))
 
                 if search_only:
                     logger.info(
-                        "조회만 수행 (--search-only). 지정석 %s편 / 입석·매진 %s편",
+                        "%s조회만 수행 (--search-only). 지정석 %s편 / 입석·매진 %s편",
+                        tag,
                         len(seated),
                         len(trains) - len(seated),
                     )
-                    return None
+                    continue
 
-                if seated:
-                    target = seated[0]
-                    logger.info("지정석 발견, 예약 시도: %s", format_train(target))
-                    result = self.try_reserve(target)
-                    if result:
-                        logger.info("예약 완료. 코레일톡/홈페이지에서 결제하세요.")
-                        deadline_date = getattr(result, "payment_deadline_date", None)
-                        deadline_time = getattr(result, "payment_deadline_time", None)
-                        if deadline_date and deadline_time:
-                            logger.info("구입기한: %s %s", deadline_date, format_hhmm(deadline_time))
-                        elif getattr(result, "payment_deadline_message", None):
-                            logger.info("구입기한: %s", result.payment_deadline_message)
-                        notify_success()
-                        return result
-                    logger.warning("예약 실패. 다음 주기에 다시 시도합니다.")
-                else:
-                    logger.info("아직 지정석 없음 (입석+좌석/매진). 계속 대기합니다.")
+                if not seated:
+                    logger.info("%s아직 지정석 없음 (입석+좌석/매진). 계속 대기합니다.", tag)
+                    continue
+
+                target = seated[0]
+                logger.info("%s지정석 발견, 예약 시도: %s", tag, format_train(target))
+                result = self.try_reserve(target)
+                if not result:
+                    logger.warning("%s예약 실패. 다음 주기에 다시 시도합니다.", tag)
+                    continue
+                leg.result = result
+                logger.info("%s예약 완료. 코레일톡/홈페이지에서 결제하세요.", tag)
+                deadline_date = getattr(result, "payment_deadline_date", None)
+                deadline_time = getattr(result, "payment_deadline_time", None)
+                if deadline_date and deadline_time:
+                    logger.info("%s구입기한: %s %s", tag, deadline_date, format_hhmm(deadline_time))
+                elif getattr(result, "payment_deadline_message", None):
+                    logger.info("%s구입기한: %s", tag, result.payment_deadline_message)
+                notify_success()
 
             if search_only:
-                return None
-            time.sleep(interval)
+                return legs
+            if all(leg.done for leg in legs):
+                if multi:
+                    logger.info("모든 구간 예약 완료.")
+                return legs
+            remaining = [leg.name for leg in legs if not leg.done]
+            if multi and len(remaining) < len(legs):
+                logger.info("남은 구간 계속 조회: %s (예약된 구간은 구입기한 안에 결제하세요)", ", ".join(remaining))
+            self._wait(interval, stop_event)
+
+    @staticmethod
+    def _wait(seconds: float, stop_event: threading.Event | None) -> None:
+        """조회 간격만큼 대기. 중지 요청이 오면 바로 깨어난다."""
+        if stop_event is None:
+            time.sleep(seconds)
+        else:
+            stop_event.wait(seconds)
 
 
 def load_credentials() -> tuple[str, str]:
@@ -357,6 +450,11 @@ def main() -> None:
         default=None,
         help="이 시각 전 도착만 (HHMMSS 또는 HH:MM). 예: 180000",
     )
+    parser.add_argument("--adult", type=int, default=1, help="어른 인원 (기본 1)")
+    parser.add_argument("--teen", type=int, default=0, help="청소년 인원")
+    parser.add_argument("--child", type=int, default=0, help="어린이 인원")
+    parser.add_argument("--senior", type=int, default=0, help="경로 인원")
+    parser.add_argument("--infant", type=int, default=0, help="동반 유아 인원 (좌석 없음)")
     parser.add_argument("--interval", type=int, default=8, help="검색 간격 (초)")
     parser.add_argument(
         "--max-attempts",
@@ -377,8 +475,19 @@ def main() -> None:
     if args.arrive_before:
         parse_time(args.arrive_before)
 
+    try:
+        passengers = KorailPassengerCounts(
+            adult=args.adult,
+            teenager=args.teen,
+            child=args.child,
+            infant=args.infant,
+            senior=args.senior,
+        )
+    except ValueError as exc:
+        parser.error(f"인원 설정 오류: {exc} (총 1~9명, 음수 불가)")
+
     korail_id, korail_pw = load_credentials()
-    macro = KTXMacro(korail_id, korail_pw)
+    macro = KTXMacro(korail_id, korail_pw, passengers=passengers)
     try:
         macro.run(
             date=args.date,
