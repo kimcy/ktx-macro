@@ -19,7 +19,7 @@ load_dotenv(interpolate=False)
 from korail_mobile_api import KorailPassengerCounts  # noqa: E402
 
 import ktx_macro  # noqa: E402
-from ktx_macro import KTXMacro, Leg, format_passengers  # noqa: E402
+from ktx_macro import KTXMacro, Leg, fetch_station_names, format_passengers  # noqa: E402
 
 st.set_page_config(page_title="KTX 매크로", page_icon="🚄", layout="wide")
 
@@ -123,11 +123,56 @@ st.caption(
 state = get_state()
 running = state.running
 
-s1, s2 = st.columns(2)
+@st.cache_data(ttl=24 * 3600, show_spinner="역 목록을 불러오는 중...")
+def load_station_names() -> list[str]:
+    """코레일 역 목록. 주요역이 앞에 오고 나머지는 가나다순. 하루 동안 캐시."""
+    return fetch_station_names()
+
+
+station_names = load_station_names()
+
+
+def station_index(name: str) -> int:
+    return station_names.index(name) if name in station_names else 0
+
+
+def swap_stations() -> None:
+    """출발역 <-> 도착역. 위젯이 그려지기 전(콜백)에 세션 상태를 바꿔야 한다."""
+    ss = st.session_state
+    ss["dep_station"], ss["arr_station"] = ss.get("arr_station"), ss.get("dep_station")
+
+
+s1, s2, s3 = st.columns([3, 3, 1])
 with s1:
-    dep = st.text_input("출발역", value="수서", disabled=running)
+    dep = st.selectbox(
+        "출발역",
+        station_names,
+        index=station_index("수서"),
+        key="dep_station",
+        disabled=running,
+        accept_new_options=True,
+        help="입력해서 검색할 수 있습니다. 목록에 없는 역은 직접 입력해도 됩니다.",
+    ) or ""
 with s2:
-    arr = st.text_input("도착역", value="부산", disabled=running)
+    arr = st.selectbox(
+        "도착역",
+        station_names,
+        index=station_index("부산"),
+        key="arr_station",
+        disabled=running,
+        accept_new_options=True,
+        help="입력해서 검색할 수 있습니다. 목록에 없는 역은 직접 입력해도 됩니다.",
+    ) or ""
+with s3:
+    st.write("")
+    st.write("")
+    st.button(
+        "⇄",
+        help="출발역과 도착역 바꾸기",
+        disabled=running,
+        use_container_width=True,
+        on_click=swap_stations,
+    )
 
 dep_name = dep.strip() or "출발역"
 arr_name = arr.strip() or "도착역"

@@ -48,6 +48,49 @@ KTX_TRAIN_GROUP = "100"
 MUGUNGHWA_MARKERS = ("무궁화",)
 
 
+# 역 목록 조회에 실패했을 때 쓰는 기본 목록 (코레일 앱 주요역 순서).
+DEFAULT_STATIONS = [
+    "서울", "용산", "광명", "수서", "영등포", "수원", "평택", "천안아산", "천안", "오송",
+    "조치원", "대전", "서대전", "김천구미", "구미", "동대구", "대구", "경주", "울산(통도사)", "포항",
+    "경산", "밀양", "부산", "구포", "창원중앙", "평창", "진부(오대산)", "강릉", "익산", "전주",
+    "광주송정", "목포", "순천", "청량리", "여수EXPO", "동해", "정동진", "안동", "서원주", "원주",
+    "마산", "행신", "나주", "정읍", "남원",
+]
+
+
+def fetch_station_names() -> list[str]:
+    """코레일 전체 역 이름 목록을 로그인 없이 받아온다.
+
+    주요역(코레일 앱 major 순위)을 먼저, 나머지는 가나다순으로 뒤에 붙인다.
+    실패하면 DEFAULT_STATIONS 를 돌려준다.
+    """
+    client = KorailClient(KorailConfig(enable_dynapath=True))
+    try:
+        stations = list(client.get_station_data().stations)
+    except Exception as exc:  # 네트워크/프로토콜 오류 등
+        logger.warning("역 목록 조회 실패, 기본 목록 사용: %s", exc)
+        return list(DEFAULT_STATIONS)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    def major_rank(st) -> int:
+        try:
+            return int(st.major)
+        except (TypeError, ValueError):
+            return 10**6
+
+    majors = sorted((s for s in stations if major_rank(s) < 10**6), key=major_rank)
+    others = sorted((s for s in stations if major_rank(s) >= 10**6), key=lambda s: s.name)
+    names: list[str] = []
+    for s in majors + others:
+        if s.name and s.name not in names:
+            names.append(s.name)
+    return names or list(DEFAULT_STATIONS)
+
+
 def parse_time(value: str) -> str:
     """HHMMSS / HHMM / HH:MM / HH:MM:SS 를 HHMMSS 로 정규화."""
     raw = value.replace(":", "").strip()

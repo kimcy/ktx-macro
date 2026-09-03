@@ -1,0 +1,7 @@
+Always respond in Korean. Write commit message in Korean.
+
+Follow this format:
+<type>: <summary>
+
+Types:
+feat, fix, refactor, style, docs, test, chore, perf, ci
